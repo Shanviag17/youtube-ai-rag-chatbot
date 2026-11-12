@@ -24,17 +24,27 @@ class RAGEngine:
             metadata={"hnsw:space": "cosine"}
         )
 
-        self.embedder = SentenceTransformer(
-            settings.embedding_model
-        )
+        # Load models only when first required
+        self._embedder = None
+        self._reranker = None
 
-        # Load reranker only when enabled
-        self.reranker = None
-
-        if settings.enable_reranker:
-            self.reranker = CrossEncoder(
-                settings.reranker_model
+    @property
+    def embedder(self):
+        if self._embedder is None:
+            self._embedder = SentenceTransformer(
+                settings.embedding_model,
+                device="cpu"
             )
+        return self._embedder
+
+    @property
+    def reranker(self):
+        if self._reranker is None and settings.enable_reranker:
+            self._reranker = CrossEncoder(
+                settings.reranker_model,
+                device="cpu"
+            )
+        return self._reranker
 
     def chunk(self, snippets, max_chars=1000, overlap=2):
         result = []
@@ -69,14 +79,14 @@ class RAGEngine:
         if not chunks:
             raise ValueError("No transcript chunks available.")
 
-        self.collection.delete(
-            where={"video_id": video_id}
-        )
-
         vectors = self.embedder.encode(
             [c["text"] for c in chunks],
             normalize_embeddings=True
         ).tolist()
+
+        self.collection.delete(
+            where={"video_id": video_id}
+        )
 
         ids = [
             f"{video_id}_{uuid.uuid4().hex}"
@@ -108,7 +118,6 @@ class RAGEngine:
     def retrieve(self, video_id, question, k=None):
 
         k = k or settings.top_k
-
         count = self.collection.count()
 
         if count == 0:
@@ -123,30 +132,25 @@ class RAGEngine:
             query_embeddings=[qvec.tolist()],
             n_results=min(count, max(k * 4, 20)),
             where={"video_id": video_id},
-            include=[
-                "documents",
-                "metadatas",
-                "embeddings"
-            ]
+            include=["documents", "metadatas", "embeddings"]
         )
 
         raw_docs = found.get("documents")
         raw_metas = found.get("metadatas")
         raw_vectors = found.get("embeddings")
 
-        docs = raw_docs[0] if raw_docs is not None and len(raw_docs) else []
-        metas = raw_metas[0] if raw_metas is not None and len(raw_metas) else []
+        docs = raw_docs[0] if raw_docs and len(raw_docs) else []
+        metas = raw_metas[0] if raw_metas and len(raw_metas) else []
 
         vectors = (
             np.asarray(raw_vectors[0], dtype=float)
-            if raw_vectors is not None and len(raw_vectors)
+            if raw_vectors and len(raw_vectors)
             else np.empty((0, len(qvec)))
         )
 
         if not docs:
             return []
 
-        # BM25 keyword retrieval
         all_data = self.collection.get(
             where={"video_id": video_id},
             include=["documents"]
@@ -180,43 +184,32 @@ class RAGEngine:
             for i, d in enumerate(docs)
         }
 
-        # Reciprocal Rank Fusion
         fused = []
 
         for doc, meta, vec in zip(docs, metas, vectors):
-
             score = (
                 1 / (60 + sem_rank.get(doc, 999999))
                 + 1 / (60 + bm_rank.get(doc, 999999))
             )
-
             fused.append((score, doc, meta, vec))
 
         fused.sort(key=lambda x: x[0], reverse=True)
-
         pool = fused[:min(len(fused), k * 2)]
 
         if not pool:
             return []
 
-        # Maximal Marginal Relevance
-        matrix = np.asarray(
-            [x[3] for x in pool],
-            dtype=float
-        )
-
+        matrix = np.asarray([x[3] for x in pool], dtype=float)
         relevance = matrix @ np.asarray(qvec)
 
         selected = []
         remaining = list(range(len(pool)))
 
         while remaining and len(selected) < min(k, len(remaining)):
-
             best = None
             best_score = -1e9
 
             for idx in remaining:
-
                 redundancy = max(
                     (
                         float(matrix[idx] @ matrix[j])
@@ -237,7 +230,6 @@ class RAGEngine:
             selected.append(best)
             remaining.remove(best)
 
-        # Build retrieved results
         results = []
 
         for idx in selected:
@@ -247,9 +239,7 @@ class RAGEngine:
                 "score": float(relevance[idx])
             })
 
-        # Cross-Encoder Reranking
         if self.reranker and results:
-
             pairs = [
                 (question, item["text"])
                 for item in results
